@@ -3,3 +3,7 @@ venv/
 __pycache__/
 *.pyc
 Phishing_Email.csv
+models/
+client_secret.json
+chrome-extension/
+LICENSE/

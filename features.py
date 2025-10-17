@@ -40,8 +40,8 @@ PHISH_KEYWORDS = ['urgent', 'account', 'verify', 'login', 'password', 'bank', 'f
 COMMON_DOMAINS = ['google.com', 'paypal.com', 'amazon.com', 'bankofamerica.com']
 
 # Cache for whois and Safe Browsing results
-WHOIS_CACHE_FILE = 'whois_cache.pkl'
-SAFE_BROWSING_CACHE_FILE = 'safe_browsing_cache.pkl'
+WHOIS_CACHE_FILE = 'models/whois_cache.pkl'
+SAFE_BROWSING_CACHE_FILE = 'models/safe_browsing_cache.pkl'
 
 def load_cache(file):
     try:
@@ -52,6 +52,7 @@ def load_cache(file):
 
 def save_cache(data, file):
     try:
+        os.makedirs('models', exist_ok=True)
         with open(file, 'wb') as f:
             pickle.dump(data, f)
     except:
