@@ -4,13 +4,12 @@ import re
 import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from nltk.corpus import stopwords
-from sklearn.feature_extraction.text import TfidfVectorizer
 import string
 from math import log
 from Levenshtein import distance as lev_distance
 import whois
 from pysafebrowsing import SafeBrowsing
-from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
+from bs4 import BeautifulSoup
 import requests
 import os
 import ssl
@@ -38,8 +37,9 @@ except:
 
 PHISH_KEYWORDS = ['urgent', 'account', 'verify', 'login', 'password', 'bank', 'free', 'win', 'click here']
 COMMON_DOMAINS = ['google.com', 'paypal.com', 'amazon.com', 'bankofamerica.com']
+SUSPICIOUS_SENDERS = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com']
 
-# Cache for whois and Safe Browsing results
+# Cache files in models folder
 WHOIS_CACHE_FILE = 'models/whois_cache.pkl'
 SAFE_BROWSING_CACHE_FILE = 'models/safe_browsing_cache.pkl'
 
@@ -78,10 +78,14 @@ def preprocess_text(text):
     text = ' '.join([word for word in text.split() if word not in stop_words])
     return text
 
-def extract_features(email_text, api_key=None):
+def extract_features(row, api_key=None):
     if not api_key:
         api_key = os.getenv('SAFE_BROWSING_KEY')
-    cleaned = preprocess_text(email_text)
+    
+    # Combine subject and body for analysis
+    combined_text = f"{row.get('subject', '')} {row.get('body', '')}"
+    cleaned = preprocess_text(combined_text)
+    
     features = {}
     features['keyword_count'] = sum(1 for kw in PHISH_KEYWORDS if kw in cleaned)
     try:
@@ -91,22 +95,42 @@ def extract_features(email_text, api_key=None):
     except:
         features['sentiment_neg'] = 0.0
     features['length'] = len(cleaned)
-    urls = re.findall(r'http\S+', email_text)
+    
+    # URLs from 'urls' column or regex
+    urls = row.get('urls', [])
+    if not urls or pd.isna(urls):
+        urls = re.findall(r'http\S+', combined_text)
+    elif isinstance(urls, str):
+        urls = urls.split(',')
+    
     features['url_count'] = len(urls)
     features['suspicious_urls'] = 0
     features['domain_age_days'] = np.nan
     features['google_safe'] = 0
+    
+    # Suspicious sender check
+    sender = row.get('sender', '')
+    if sender and any(susp in sender.lower() for susp in SUSPICIOUS_SENDERS):
+        features['suspicious_urls'] += 1
 
     for url in urls:
+        url = url.strip()
+        if not url:
+            continue
+        
+        # Entropy check
         chars = ''.join(re.findall(r'[a-zA-Z0-9]', url.lower()))
         if len(chars) > 0:
             freq = {c: chars.count(c) / len(chars) for c in set(chars)}
             entropy = -sum(p * log(p) for p in freq.values() if p > 0)
             if entropy > 3.5:
                 features['suspicious_urls'] += 1
+        
+        # Domain typo check
         domain = re.search(r'://([^/]+)', url).group(1) if re.search(r'://([^/]+)', url) else ''
         if any(lev_distance(domain, common) < 3 for common in COMMON_DOMAINS):
             features['suspicious_urls'] += 1
+        
         # Whois lookup with cache
         domain_hash = hashlib.md5(domain.encode()).hexdigest()
         if domain_hash in whois_cache:
@@ -124,11 +148,12 @@ def extract_features(email_text, api_key=None):
                 creation_date = creation_date[0]
             try:
                 age = (pd.Timestamp.now() - pd.to_datetime(creation_date)).days
-                features['domain_age_days'] = age if not np.isnan(age) else features['domain_age_days']
+                features['domain_age_days'] = age
                 if age < 30:
                     features['suspicious_urls'] += 1
             except:
                 pass
+        
         # Redirect check
         try:
             r = requests.head(url, allow_redirects=True, timeout=5)
@@ -136,7 +161,8 @@ def extract_features(email_text, api_key=None):
                 features['suspicious_urls'] += 1
         except:
             pass
-        # Safe Browsing with cache
+        
+        # Google Safe Browsing with cache
         if api_key:
             url_hash = hashlib.md5(url.encode()).hexdigest()
             if url_hash in safe_browsing_cache:
@@ -150,4 +176,5 @@ def extract_features(email_text, api_key=None):
                     save_cache(safe_browsing_cache, SAFE_BROWSING_CACHE_FILE)
                 except:
                     pass
-    return features, cleaned, urls
+    
+    return features, cleaned, urls, combined_text

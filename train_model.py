@@ -1,160 +1,172 @@
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, classification_report
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import train_test_split
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
+import tensorflow as tf
+from tensorflow import keras
+from keras.preprocessing.text import Tokenizer
+from keras.preprocessing.sequence import pad_sequences
+from keras.models import Model
+from keras.layers import Input, Embedding, LSTM, Dense, Concatenate, Dropout, BatchNormalization
+from keras.callbacks import EarlyStopping, ModelCheckpoint
+from keras.optimizers import Adam
+from imblearn.over_sampling import RandomOverSampler
 import joblib
-from features import preprocess_text, extract_features
+from features import extract_features
 from tqdm import tqdm
 import pickle
 import os
 import multiprocessing as mp
 import logging
 
-# Set up minimal logging
+# Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Checkpoint file
-CHECKPOINT_FILE = 'models/features_checkpoint.pkl'
+# Constants
+CHECKPOINT_FILE = 'models/xgb/features_checkpoint_dl.pkl'
+MODEL_SAVE_PATH = 'models/xgb/phishing_model_lstm.h5'
+MAX_WORDS = 10000
+MAX_LEN = 200
+EPOCHS = 100
+BATCH_SIZE = 32
+PATIENCE = 10
 
 def load_checkpoint(file=CHECKPOINT_FILE):
     if os.path.exists(file):
         with open(file, 'rb') as f:
             checkpoint = pickle.load(f)
         logging.info(f"Loaded checkpoint from index {checkpoint['last_index']}")
-        return checkpoint['features_list'], checkpoint['last_index']
-    return [], -1
+        return checkpoint['struct_features'], checkpoint['texts'], checkpoint['last_index']
+    return [], [], -1
 
-def save_checkpoint(features_list, index, file=CHECKPOINT_FILE):
+def save_checkpoint(struct_features, texts, index, file=CHECKPOINT_FILE):
     os.makedirs('models', exist_ok=True)
     with open(file, 'wb') as f:
-        pickle.dump({'features_list': features_list, 'last_index': index}, f)
+        pickle.dump({'struct_features': struct_features, 'texts': texts, 'last_index': index}, f)
     logging.info(f"Saved checkpoint at index {index}")
 
-def process_email(args):
-    idx, text = args
+def process_row(row):
     try:
-        feats, _, _ = extract_features(text)
-        return [feats['keyword_count'], feats['sentiment_neg'], feats['length'],
-                feats['url_count'], feats['suspicious_urls'], feats['domain_age_days'],
-                feats['google_safe']]
-    except:
-        return [0, 0.0, 0, 0, 0, np.nan, 0]
+        feats, cleaned, urls, combined_text = extract_features(row)
+        struct = [feats['keyword_count'], feats['sentiment_neg'], feats['length'],
+                  feats['url_count'], feats['suspicious_urls'], feats['domain_age_days'],
+                  feats['google_safe']]
+        return struct, combined_text
+    except Exception as e:
+        logging.warning(f"Error processing row: {e}")
+        return [0, 0.0, 0, 0, 0, np.nan, 0], ""
 
 # Load dataset
 logging.info("Loading dataset...")
 try:
-    df = pd.read_csv('Phishing_Email.csv')
+    df = pd.read_csv('TREC_07.csv')
 except Exception as e:
     logging.error(f"Failed to load dataset: {e}")
     exit(1)
 
 if df.empty:
-    logging.error("Dataset is empty. Check Phishing_Email.csv.")
+    logging.error("Dataset is empty.")
     exit(1)
 
-# Drop unnecessary columns
-if 'Unnamed: 0' in df.columns:
-    df = df.drop(columns=['Unnamed: 0'])
-    logging.info("Dropped 'Unnamed: 0' column")
+df['subject'] = df['subject'].fillna('')
+df['body'] = df['body'].fillna('')
+df['label'] = df['label'].map({'ham': 0, 'phishing': 1, 'spam': 0})
+df = df.dropna(subset=['label'])
+logging.info(f"Dataset loaded: {df.shape[0]} rows")
 
-# Verify expected columns
-expected_columns = ['Email Text', 'Email Type']
-if not all(col in df.columns for col in expected_columns):
-    logging.error(f"Expected columns {expected_columns}, found {df.columns.tolist()}")
-    exit(1)
-
-df['Email Text'] = df['Email Text'].fillna('')
-df['Email Type'] = df['Email Type'].map({'Safe Email': 0, 'Phishing Email': 1})
-df = df.dropna(subset=['Email Type'])
-logging.info(f"Dataset loaded: {df.shape[0]} rows, {df.shape[1]} columns")
-
-# Load checkpoint if exists
-features_list, last_index = load_checkpoint()
+# Load or extract features
+struct_list, text_list, last_index = load_checkpoint()
 start_index = last_index + 1 if last_index >= 0 else 0
 
-# Extract features with parallel processing
-logging.info("Extracting features with URL checks (may take 10-20 mins)...")
-if start_index < len(df['Email Text']):
+if start_index < len(df):
     batch_size = 500
-    for batch_start in range(start_index, len(df['Email Text']), batch_size):
-        batch_end = min(batch_start + batch_size, len(df['Email Text']))
-        batch = [(i, df['Email Text'].iloc[i]) for i in range(batch_start, batch_end)]
-        logging.info(f"Processing batch {batch_start} to {batch_end-1}")
+    for batch_start in range(start_index, len(df), batch_size):
+        batch_end = min(batch_start + batch_size, len(df))
+        batch_df = df.iloc[batch_start:batch_end]
+        logging.info(f"Processing batch {batch_start} to {batch_end - 1}")
         try:
             with mp.Pool(processes=mp.cpu_count()) as pool:
-                batch_features = list(tqdm(pool.imap(process_email, batch), total=len(batch), desc="Processing Batch"))
-            features_list.extend(batch_features)
-            save_checkpoint(features_list, batch_end - 1)
+                results = list(tqdm(pool.imap(process_row, [row for _, row in batch_df.iterrows()]), total=len(batch_df), desc="Extracting Features"))
+            struct_batch, text_batch = zip(*results)
+            struct_list.extend(struct_batch)
+            text_list.extend(text_batch)
+            save_checkpoint(struct_list, text_list, batch_end - 1)
         except KeyboardInterrupt:
-            logging.info("KeyboardInterrupt detected. Saving checkpoint and exiting...")
-            save_checkpoint(features_list, batch_end - 1)
+            logging.info("Interrupted. Saving checkpoint...")
+            save_checkpoint(struct_list, text_list, batch_end - 1)
             exit(0)
+        except Exception as e:
+            logging.error(f"Batch error: {e}")
 
-if not features_list:
-    logging.error("No features extracted. Check features.py or dataset.")
+if not struct_list:
+    logging.error("No features extracted.")
     exit(1)
 
-X = pd.DataFrame(features_list, columns=['keyword_count', 'sentiment_neg', 'length',
-                                         'url_count', 'suspicious_urls', 'domain_age_days',
-                                         'google_safe'])
-logging.info(f"Feature matrix shape: {X.shape}")
+X_struct = pd.DataFrame(struct_list, columns=['keyword_count', 'sentiment_neg', 'length',
+                                              'url_count', 'suspicious_urls', 'domain_age_days',
+                                              'google_safe'])
+y = df['label'].values
 
-# Impute NaN values and drop all-NaN columns
-logging.info("Imputing missing values...")
+logging.info("Imputing and scaling structured features...")
 imputer = SimpleImputer(strategy='mean')
-X_imputed = imputer.fit_transform(X)
-valid_columns = [col for col, values in zip(X.columns, X_imputed.T) if not np.all(np.isnan(values))]
-X = pd.DataFrame(X_imputed, columns=X.columns)[valid_columns]
-logging.info(f"Feature matrix after imputation: {X.shape}")
-
-# Scale features
-logging.info("Scaling features...")
+X_struct_imputed = imputer.fit_transform(X_struct)
 scaler = StandardScaler()
-X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=X.columns)
+X_struct_scaled = scaler.fit_transform(X_struct_imputed)
 
-# Enhanced TF-IDF (bigrams, more features)
-logging.info("Computing enhanced TF-IDF features...")
-vectorizer = TfidfVectorizer(max_features=500, ngram_range=(1, 2))
-tfidf_features = vectorizer.fit_transform(df['Email Text'].apply(preprocess_text)).toarray()
-X_tfidf = pd.DataFrame(tfidf_features, columns=[f'tfidf_{i}' for i in range(tfidf_features.shape[1])])
-X = pd.concat([X_scaled, X_tfidf], axis=1)
-logging.info(f"Final feature matrix shape: {X.shape}")
+logging.info("Tokenizing text sequences...")
+tokenizer = Tokenizer(num_words=MAX_WORDS)
+tokenizer.fit_on_texts(text_list)
+X_text_seq = tokenizer.texts_to_sequences(text_list)
+X_text_padded = pad_sequences(X_text_seq, maxlen=MAX_LEN)
 
-y = df['Email Type']
+logging.info("Oversampling for class balance...")
+ros = RandomOverSampler(random_state=42)
+X_struct_res, y_res = ros.fit_resample(X_struct_scaled, y)
+X_text_res, _ = ros.fit_resample(X_text_padded, y)
 
-# Split data
-logging.info("Splitting data...")
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+X_struct_train, X_struct_test, X_text_train, X_text_test, y_train, y_test = train_test_split(
+    X_struct_res, X_text_res, y_res, test_size=0.2, random_state=42, stratify=y_res)
 
-# Train optimized model with tuning
-logging.info("Training optimized RandomForest model with hyperparameter tuning...")
-model = RandomForestClassifier(class_weight='balanced', random_state=42, n_jobs=-1)
-param_grid = {
-    'n_estimators': [200, 300],
-    'max_depth': [None, 20],
-    'min_samples_split': [2, 5]
-}
-grid_search = GridSearchCV(model, param_grid, cv=3, scoring='accuracy', n_jobs=-1)
-grid_search.fit(X_train, y_train)
-best_model = grid_search.best_estimator_
-logging.info(f"Best parameters: {grid_search.best_params_}")
+logging.info("Building LSTM model...")
+text_input = Input(shape=(MAX_LEN,), name='text_input')
+embedding = Embedding(MAX_WORDS, 128, input_length=MAX_LEN)(text_input)
+lstm_out = LSTM(128, dropout=0.5, recurrent_dropout=0.5)(embedding)
+lstm_out = BatchNormalization()(lstm_out)
 
-# Evaluate
-logging.info("Evaluating optimized model...")
-y_pred = best_model.predict(X_test)
-print("Optimized Accuracy:", accuracy_score(y_test, y_pred))
-print("\nOptimized Classification Report:")
-print(classification_report(y_test, y_pred, target_names=['Safe', 'Phishing']))
+struct_input = Input(shape=(X_struct_train.shape[1],), name='struct_input')
+dense_struct = Dense(64, activation='relu')(struct_input)
+dense_struct = Dropout(0.5)(dense_struct)
 
-# Save optimized model and components to models folder
-logging.info("Saving optimized model and components to models folder...")
-os.makedirs('models', exist_ok=True)
-joblib.dump(best_model, 'models/phishing_model_optimized.pkl')
-joblib.dump(vectorizer, 'models/tfidf_vectorizer.pkl')
-joblib.dump(imputer, 'models/imputer.pkl')
-joblib.dump(scaler, 'models/scaler.pkl')
-print("Optimized model saved as 'models/phishing_model_optimized.pkl'")
+concat = Concatenate()([lstm_out, dense_struct])
+dense = Dense(64, activation='relu')(concat)
+dense = BatchNormalization()(dense)
+dense = Dropout(0.5)(dense)
+output = Dense(1, activation='sigmoid')(dense)
+
+model = Model(inputs=[text_input, struct_input], outputs=output)
+model.compile(optimizer=Adam(learning_rate=0.001), loss='binary_crossentropy', metrics=['accuracy'])
+model.summary()
+
+early_stop = EarlyStopping(monitor='val_accuracy', patience=PATIENCE, restore_best_weights=True)
+checkpoint = ModelCheckpoint(MODEL_SAVE_PATH, monitor='val_accuracy', save_best_only=True, verbose=1)
+
+logging.info(f"Starting training for up to {EPOCHS} epochs...")
+history = model.fit(
+    [X_text_train, X_struct_train], y_train,
+    validation_data=([X_text_test, X_struct_test], y_test),
+    epochs=EPOCHS,
+    batch_size=BATCH_SIZE,
+    callbacks=[early_stop, checkpoint],
+    verbose=1
+)
+
+loss, acc = model.evaluate([X_text_test, X_struct_test], y_test, verbose=0)
+print(f"Final Test Accuracy: {acc:.4f}")
+print(f"Training completed after {len(history.history['loss'])} epochs.")
+
+logging.info("Saving tokenizer, imputer, and scaler...")
+joblib.dump(tokenizer, 'models/xgb/tokenizer.pkl')
+joblib.dump(imputer, 'models/xgb/imputer_dl.pkl')
+joblib.dump(scaler, 'models/xgb/scaler_dl.pkl')
+print("All components saved to models/xgb/ folder.")

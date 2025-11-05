@@ -1,0 +1,15 @@
+# Requirements for AI-Powered Phishing Detection System (MacBook Air M4, Python 3.13, TF 2.16.2)
+tensorflow
+keras
+pandas
+numpy
+scikit-learn
+imbalanced-learn
+nltk
+beautifulsoup4
+pysafebrowsing
+python-whois
+python-Levenshtein
+requests
+tqdm
+joblib
